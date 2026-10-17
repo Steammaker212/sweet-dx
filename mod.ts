@@ -9,10 +9,12 @@ Run from the folder that contains ./source (code, hooks, nso, symbols).
 Options:
   -v, --verbose   Echo the full build log to the console (always saved to debug.log)
       --dry-run   Build and validate everything without writing into ./atmosphere
+      --skip-build-id-check
+                  Build even if source/nso/main is not the supported game version
   -h, --help      Show this help
 `;
 
-const KNOWN = new Set([ "-v", "--verbose", "--dry-run", "-h", "--help" ]);
+const KNOWN = new Set([ "-v", "--verbose", "--dry-run", "--skip-build-id-check", "-h", "--help" ]);
 const unknown = Deno.args.filter(arg => !KNOWN.has(arg));
 
 if (Deno.args.includes("-h") || Deno.args.includes("--help")) {
@@ -29,7 +31,8 @@ if (unknown.length > 0) {
 try {
     const summary = compile({
         verbose: Deno.args.includes("-v") || Deno.args.includes("--verbose"),
-        dryRun: Deno.args.includes("--dry-run")
+        dryRun: Deno.args.includes("--dry-run"),
+        skipBuildIdCheck: Deno.args.includes("--skip-build-id-check")
     });
 
     for (const warning of summary.warnings) console.warn(`WARNING: ${warning}`);

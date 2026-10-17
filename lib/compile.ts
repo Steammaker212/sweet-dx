@@ -38,6 +38,8 @@ export interface CompileOptions {
     verbose?: boolean;
     /** Build everything but do not write anything into ./atmosphere. */
     dryRun?: boolean;
+    /** Downgrade the "wrong game version" (build ID) error to a warning. */
+    skipBuildIdCheck?: boolean;
 }
 
 export interface CompileSummary {
@@ -52,6 +54,33 @@ export interface CompileSummary {
     ips: string;
     warnings: string[];
     durationMs: number;
+}
+
+/**
+ * Heuristic check (ARM mode) for instructions whose behaviour depends on their own address.
+ * A trampoline copies the original instruction elsewhere, which silently changes these.
+ */
+function describePcRelative(word: number): string | null {
+    const bits27to25 = (word >>> 25) & 0b111;
+    const rn = (word >>> 16) & 0xF;
+
+    if (bits27to25 === 0b101) return "a branch (B/BL/BLX)";
+    if (rn !== 0xF) return null;
+
+    if (bits27to25 === 0b010 || bits27to25 === 0b011) return "a PC-relative load/store (LDR/STR [pc, ...])";
+    if (bits27to25 === 0b110) return "a PC-relative VFP/coprocessor load/store (VLDR [pc, ...])";
+
+    if (bits27to25 === 0b000 && (word & 0x90) === 0x90) {
+        return (word & 0x60) !== 0 ? "a PC-relative halfword/doubleword load/store" : null;
+    }
+
+    if (bits27to25 === 0b000 || bits27to25 === 0b001) {
+        const opcode = (word >>> 21) & 0xF;
+
+        if (opcode === 0b0100 || opcode === 0b0010) return "an ADR-style PC-relative address calculation (ADD/SUB rX, pc, ...)";
+    }
+
+    return null;
 }
 
 /** Detects IPS patches that touch the same bytes (the later one would silently win). */
@@ -211,6 +240,7 @@ export function compile(options: CompileOptions = {}): CompileSummary {
     const guard = new OutputGuard();
     const ledger = new PatchLedger();
     const warnings: string[] = [];
+    let mainHandle = null as { close(): void } | null;
     const summary: CompileSummary = {
         sources: 0, symbolFiles: 0, hooks: 0, trampolines: 0, objects: 0, patches: 0,
         deployed: false,
@@ -248,6 +278,8 @@ export function compile(options: CompileOptions = {}): CompileSummary {
         const files = modules.archivo.listFiles("./source");
         const code = files.filter(file => file.entry.extension === ".cpp" || file.entry.extension === ".s" || file.entry.extension === ".c");
         const main = new modules.filetendo.ParsedNSO("./source/nso/main");
+
+        mainHandle = main;
 
         const symbols = files.filter(file => file.entry.extension === ".sym").map(symPath => {
             log.info(`Loading symbol file "${symPath.entry.path.normal}"...`);
@@ -297,6 +329,85 @@ export function compile(options: CompileOptions = {}): CompileSummary {
         if (code.length === 0) {
             throw new Error("No .cpp, .c or .s source files were found under \"./source\".");
         }
+
+        // Validate everything we can BEFORE spending time in clang, and report every problem at once.
+        const validateInputs = (): void => {
+            const problems: string[] = [];
+            const warn = (message: string): void => {
+                warnings.push(message);
+                log.info(`WARNING: ${message}`);
+            };
+
+            // 1. Is this the game version SweetDX targets? Wrong dump = wrong addresses everywhere,
+            //    and an IPS file named for a different build ID is never loaded by Atmosphere.
+            const buildHex = [ ...main.buildId ].map(byte => byte.toString(16).padStart(2, "0")).join("").toUpperCase();
+            const actualBuildId = buildHex.slice(0, constants.NSMBUDX_BUILD_ID.length);
+
+            if (actualBuildId !== constants.NSMBUDX_BUILD_ID) {
+                const message = `"source/nso/main" has build ID ${actualBuildId}, but SweetDX targets ${constants.NSMBUDX_BUILD_ID} (New Super Mario Bros. U Deluxe v1.0.0). Hook addresses would be wrong and the IPS patch would never be loaded.`;
+
+                if (options.skipBuildIdCheck) warn(message);
+                else problems.push(message + " Use --skip-build-id-check to build anyway.");
+            }
+
+            // 2. Per-hook checks.
+            const textSize = main.text.size;
+            const hookNames = new Set<string>();
+            const trampolineNames = new Set<string>();
+
+            for (const hook of hooks) {
+                const where = `hook "${hook.name}" at ${modules.utils.hexify(hook.address)}`;
+
+                if (hookNames.has(hook.name)) warn(`Hook name "${hook.name}" is defined more than once; logs will be ambiguous.`);
+                hookNames.add(hook.name);
+
+                if (hook.type === "data") {
+                    const end = hook.address + hook.data.length;
+
+                    if (hook.data.length === 0) {
+                        problems.push(`${where}: raw data is empty.`);
+                    } else if (!main.segments.some(segment => hook.address >= segment.memoryOffset && end <= segment.memoryOffset + segment.size)) {
+                        problems.push(`${where}: ${hook.data.length} byte(s) of raw data do not fit inside any NSO segment (.text, .ro or .data).`);
+                    }
+
+                    continue;
+                }
+
+                // hook / call / instr all write one 4-byte ARM instruction into .text.
+                let inText = true;
+
+                if (hook.address % 4 !== 0) {
+                    problems.push(`${where}: address must be a multiple of 4 (ARM mode instructions are 4 bytes).`);
+                    inText = false;
+                } else if (hook.address < 0 || hook.address + 4 > textSize) {
+                    problems.push(`${where}: address is outside .text (size ${modules.utils.hexify(textSize)}).`);
+                    inText = false;
+                }
+
+                if (hook.type === "hook" && hook.trampoline) {
+                    if (trampolineNames.has(hook.trampoline)) {
+                        problems.push(`${where}: trampoline name "${hook.trampoline}" is used by more than one hook; each trampoline needs a unique name.`);
+                    }
+
+                    trampolineNames.add(hook.trampoline);
+
+                    if (inText) {
+                        const kind = describePcRelative(main.getInstructionAt(hook.address));
+
+                        if (kind) {
+                            warn(`${where}: the original instruction is ${kind}. The trampoline relocates it, which changes what it does; handle that instruction in your hook instead.`);
+                        }
+                    }
+                }
+            }
+
+            if (problems.length > 0) {
+                throw new Error(`Input validation failed (${problems.length} problem${problems.length === 1 ? "" : "s"}):\n - ${problems.join("\n - ")}`);
+            }
+        };
+
+        log.info("Validating inputs...");
+        validateInputs();
 
         const assets = {
             crt0: modules.way.join(import.meta.dirname!, "../assets/crt0.s"),
@@ -483,6 +594,8 @@ ${hook.trampoline}:
             const elf = new modules.elfo.Elf(elfpath);
             const nso = new modules.filetendo.NSO(stagedSubsdk0);
 
+            try {
+
             const dynsym = elf.findSection(".dynsym");
             const dynstr = elf.findSection(".dynstr");
             const bss = elf.findSection(".bss");
@@ -563,6 +676,16 @@ ${hook.trampoline}:
             nso.writeSection(".data", data.read());
 
             nso.digest();
+            } catch (error) {
+                nso.abort(); // never leave the half-written NSO open
+                throw error;
+            } finally {
+                try {
+                    elf.file.close();
+                } catch {
+                    // Already closed.
+                }
+            }
 
             log.info(`Staged NSO at "${stagedSubsdk0}".`);
 
@@ -605,6 +728,12 @@ ${hook.trampoline}:
         // Let the caller (mod.ts) report the error and set a failing exit code.
         throw error;
     } finally {
+        try {
+            mainHandle?.close();
+        } catch {
+            // Already closed.
+        }
+
         log.close();
     }
 }
