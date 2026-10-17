@@ -5,7 +5,7 @@ import * as modules from "../deps.ts"
 class CompileLog {
     private readonly file: modules.archivo.Archivo;
 
-    constructor(path: string) {
+    constructor(path: string, private readonly echo: boolean = false) {
         if (modules.archivo.existsAsFile(path)) {
             Deno.removeSync(path);
         }
@@ -14,7 +14,10 @@ class CompileLog {
     }
 
     private write(level: "INFO" | "ERROR", message: string): void {
-        this.file.appendText(`[${new Date().toISOString()}] [${level}] ${message}\n`);
+        const line = `[${new Date().toISOString()}] [${level}] ${message}`;
+
+        this.file.appendText(line + "\n");
+        if (this.echo) console.log(line);
     }
 
     info(message: string): void {
@@ -27,6 +30,55 @@ class CompileLog {
 
     close(): void {
         this.file.close();
+    }
+}
+
+export interface CompileOptions {
+    /** Echo every log line to the console as well as debug.log. */
+    verbose?: boolean;
+    /** Build everything but do not write anything into ./atmosphere. */
+    dryRun?: boolean;
+}
+
+export interface CompileSummary {
+    sources: number;
+    symbolFiles: number;
+    hooks: number;
+    trampolines: number;
+    objects: number;
+    patches: number;
+    deployed: boolean;
+    subsdk0: string;
+    ips: string;
+    warnings: string[];
+    durationMs: number;
+}
+
+/** Detects IPS patches that touch the same bytes (the later one would silently win). */
+class PatchLedger {
+    private readonly entries: { start: number; end: number; data: Uint8Array; reason: string }[] = [];
+
+    /** Returns a warning for a harmless exact duplicate, throws on a real conflict. */
+    add(patch: { address: number; data: Uint8Array }, reason: string): string | null {
+        const start = patch.address;
+        const end = patch.address + patch.data.length;
+
+        for (const other of this.entries) {
+            if (start < other.end && other.start < end) {
+                if (start === other.start && end === other.end && modules.utils.compareBuffers(patch.data, other.data)) {
+                    return `Duplicate identical patch at ${modules.utils.hexify(start)}: ${reason} repeats ${other.reason}.`;
+                }
+
+                throw new Error(
+                    `Conflicting patches: ${reason} (${modules.utils.hexify(start)}-${modules.utils.hexify(end)}) ` +
+                    `overlaps ${other.reason} (${modules.utils.hexify(other.start)}-${modules.utils.hexify(other.end)}). ` +
+                    `Two hooks cannot modify the same bytes.`
+                );
+            }
+        }
+
+        this.entries.push({ start, end, data: patch.data, reason });
+        return null;
     }
 }
 
@@ -109,7 +161,9 @@ class OutputGuard {
         }
 
         // Only directories this run created, and only if they are empty.
-        for (const dir of this.createdDirs) {
+        // Deepest first: a child always has a longer path than its parent, and
+        // directories recorded by different mkdir() calls can share ancestors.
+        for (const dir of [ ...this.createdDirs ].sort((a, b) => b.length - a.length)) {
             try {
                 Deno.removeSync(dir);
             } catch {
@@ -130,13 +184,16 @@ function requireTool(log: CompileLog, name: string, hint: string): void {
     log.info(`Found ${name}: ${firstLine}`);
 }
 
-function checkSpawnResult(name: string, proc: { status: number | null; error?: Error }): void {
+function checkSpawnResult(name: string, proc: { status: number | null; error?: Error; stderr?: Uint8Array | null }): void {
     if (proc.error) {
         throw new Error(`Failed to run "${name}": ${proc.error.message}`);
     }
 
     if (proc.status !== 0) {
-        throw new Error(`"${name}" exited with a non-zero status code: ${proc.status}`);
+        const stderr = proc.stderr ? modules.utils.decode(proc.stderr).trim() : "";
+        const shown = stderr.length > 6000 ? stderr.slice(0, 6000) + "\n... (truncated, see debug.log)" : stderr;
+
+        throw new Error(`"${name}" exited with a non-zero status code: ${proc.status}${shown ? `\n${shown}` : ""}`);
     }
 }
 
@@ -148,9 +205,20 @@ function logProcessOutput(log: CompileLog, name: string, proc: { stdout: Uint8Ar
     log.info(`${name} exited.${stdout.length > 0 ? `\n--- stdout ---\n${stdout}` : ""}${stderr.length > 0 ? `\n--- stderr ---\n${stderr}` : ""}`);
 }
 
-export function compile() {
-    const log = new CompileLog("./debug.log");
+export function compile(options: CompileOptions = {}): CompileSummary {
+    const startedAt = performance.now();
+    const log = new CompileLog("./debug.log", options.verbose ?? false);
     const guard = new OutputGuard();
+    const ledger = new PatchLedger();
+    const warnings: string[] = [];
+    const summary: CompileSummary = {
+        sources: 0, symbolFiles: 0, hooks: 0, trampolines: 0, objects: 0, patches: 0,
+        deployed: false,
+        subsdk0: constants.NSMBUDX_SUBSDK0_PATH,
+        ips: constants.NSMBUDX_IPS_PATH,
+        warnings,
+        durationMs: 0
+    };
 
     try {
         log.info("Checking source environment...");
@@ -161,8 +229,11 @@ export function compile() {
             folders: [ "./source/code", "./source/hooks", "./source/nso", "./source/symbols" ],
             files: [ "./source/nso/main" ],
 
+            // NOTE: "available" means "must NOT already exist". ./atmosphere used to be
+            // listed here, so any existing atmosphere folder failed the check and the
+            // old catch block then deleted it. Output is now staged and deployed safely.
             available: {
-                folders: [ "./atmosphere" ],
+                folders: [],
                 files: []
             }
         });
@@ -171,14 +242,6 @@ export function compile() {
 
         requireTool(log, "clang++", "Install LLVM/Clang and make sure clang++ is on your PATH.");
         requireTool(log, "arm-none-eabi-ld", "Install the Arm GNU Toolchain (arm-none-eabi) and make sure it is on your PATH.");
-
-        log.info("Creating output directories...");
-
-        guard.mkdir(constants.NSMBUDX_EXEFS_PATCHES_PATH);
-        guard.mkdir(constants.NSMBUDX_EXEFS_PATH);
-
-        guard.claim(constants.NSMBUDX_SUBSDK0_PATH);
-        guard.claim(constants.NSMBUDX_IPS_PATH);
 
         log.info("Listing source files...");
 
@@ -211,12 +274,25 @@ export function compile() {
         const ips = new modules.lunar.IPSPatch();
 
         const addPatch = (patch: { address: number, data: Uint8Array }, reason: string): void => {
+            const warning = ledger.add(patch, reason);
+
+            if (warning) {
+                warnings.push(warning);
+                log.info(`WARNING: ${warning}`);
+                return;
+            }
+
             ips.addPatch(patch);
+            summary.patches++;
             log.info(`Added IPS patch at ${modules.utils.hexify(patch.address)} (${patch.data.length} byte(s)): ${reason}`);
             log.info(`IPS Patch at ${modules.utils.hexify(patch.address)} set to ${[ ...patch.data ].map(byte => modules.utils.hexify(byte, 2, true)).join(", ")}`);
         };
 
         log.info(`Found ${code.length} source file(s), ${symbols.length} symbol file(s) and ${hooks.length} hook definition(s).`);
+
+        summary.sources = code.length;
+        summary.symbolFiles = symbols.length;
+        summary.hooks = hooks.length;
 
         if (code.length === 0) {
             throw new Error("No .cpp, .c or .s source files were found under \"./source\".");
@@ -247,12 +323,23 @@ export function compile() {
 
             log.info(`Working in temporary directory "${dirpath}".`);
 
+            // Everything is built here first; ./atmosphere is only touched after a full success.
+            const stageExefs = modules.way.join(dirpath, "./stage/exefs");
+            const stagePatches = modules.way.join(dirpath, "./stage/patches");
+
+            Deno.mkdirSync(stageExefs, { recursive: true });
+            Deno.mkdirSync(stagePatches, { recursive: true });
+
+            const stagedSubsdk0 = modules.way.join(stageExefs, "./subsdk0");
+            const stagedIps = modules.way.join(stagePatches, `./${constants.NSMBUDX_BUILD_ID}.ips`);
+
             const asm = new modules.archivo.Archivo(modules.way.join(dirpath, "./hooks.s"));
             const linkers = [ "-T", assets.linker, "-T", assets.sdk ] as string[];
             const elfpath = modules.way.join(dirpath, "./subsdk0.elf");
 
             asm.appendText("\n");
 
+            try {
             for (const hook of hooks) {
                 log.info(`Processing hook "${hook.name}" (type: ${hook.type}, address: ${modules.utils.hexify(hook.address)}).`);
 
@@ -299,7 +386,9 @@ ${hook.trampoline}:
                 }
             }
 
-            asm.close();
+            } finally {
+                asm.close();
+            }
 
             log.info("Wrote hook trampolines to \"hooks.s\".");
 
@@ -314,7 +403,7 @@ ${hook.trampoline}:
             log.info("Invoking clang++...");
             log.info("");
 
-            const compileResult = modules.child_process.spawnSync("clang++", (argv = [
+            const commonFlags = [
                 "--target=armv7l-none-eabihf",
                 "-mcpu=cortex-a57",
                 "-mfpu=crypto-neon-fp-armv8",
@@ -324,24 +413,54 @@ ${hook.trampoline}:
                 "-fno-rtti",
                 "-fno-exceptions",
                 "-fpermissive",
-                "-c",
+                "-I",
+                modules.way.join(modules.way.cwd(), "./source/code")
+            ];
+
+            const inputs = [
                 assets.crt0,
                 asm.info.entry.path.normal,
                 ...code.map(({ entry }) => entry.path.normal)
-            ]), { stdio: "pipe", cwd: dirpath });
+            ];
 
-            logProcessOutput(log, "clang++", compileResult, argv);
-            checkSpawnResult("clang++", compileResult);
+            const objs: string[] = [];
+            const failures: string[] = [];
+
+            // One invocation per file with an explicit -o. A single multi-file invocation names
+            // objects after the file's basename, so two files called util.cpp in different
+            // folders (or a user file called hooks.cpp / crt0.cpp) silently overwrote each other.
+            for (const [ index, input ] of inputs.entries()) {
+                const base = input.split(/[\\/]/).pop()!.replace(/\.[^.]*$/, "");
+                const obj = modules.way.join(dirpath, `${index}_${base}.o`);
+
+                argv = [ ...commonFlags, "-c", input, "-o", obj ];
+
+                const result = modules.child_process.spawnSync("clang++", argv, { stdio: "pipe", cwd: dirpath });
+
+                logProcessOutput(log, "clang++", result, argv);
+
+                if (result.error || result.status !== 0) {
+                    const stderr = result.stderr ? modules.utils.decode(result.stderr).trim() : "";
+                    failures.push(`${input}${result.error ? `\n${result.error.message}` : ""}${stderr ? `\n${stderr}` : ""}`);
+                    continue;
+                }
+
+                objs.push(obj);
+            }
+
             log.info("");
 
-            const objs = modules.archivo.listFiles(dirpath)
-                            .filter(({ entry }) => entry.extension === ".o")
-                            .map(({ entry }) => entry.path.normal);
+            if (failures.length > 0) {
+                const report = failures.join("\n\n");
+
+                throw new Error(`clang++ failed on ${failures.length} of ${inputs.length} file(s):\n\n${report.length > 12000 ? report.slice(0, 12000) + "\n... (truncated, see debug.log)" : report}`);
+            }
 
             if (objs.length === 0) {
                 throw new Error("clang++ did not produce any object files.");
             }
 
+            summary.objects = objs.length;
             log.info(`Compiled ${objs.length} object file(s).`);
             log.info("Invoking arm-none-eabi-ld...");
             log.info("");
@@ -362,7 +481,7 @@ ${hook.trampoline}:
             log.info(`Linked ELF at "${elfpath}".`);
 
             const elf = new modules.elfo.Elf(elfpath);
-            const nso = new modules.filetendo.NSO(constants.NSMBUDX_SUBSDK0_PATH);
+            const nso = new modules.filetendo.NSO(stagedSubsdk0);
 
             const dynsym = elf.findSection(".dynsym");
             const dynstr = elf.findSection(".dynstr");
@@ -426,6 +545,7 @@ ${hook.trampoline}:
                 }
             }).filter(trampoline => trampoline !== null);
 
+            summary.trampolines = trampolines.length;
             log.info(`Resolved ${trampolines.length} trampoline patch(es).`);
 
             nso.writeSection(".text", modules.utils.interceptReadStream(text.read(4), ([chunk, offset]) => {
@@ -444,15 +564,37 @@ ${hook.trampoline}:
 
             nso.digest();
 
-            log.info(`Wrote NSO to "${constants.NSMBUDX_SUBSDK0_PATH}".`);
+            log.info(`Staged NSO at "${stagedSubsdk0}".`);
 
-            ips.writeToNewFile(constants.NSMBUDX_IPS_PATH);
+            ips.writeToNewFile(stagedIps);
 
-            log.info(`Wrote IPS patch to "${constants.NSMBUDX_IPS_PATH}".`);
+            log.info(`Staged IPS patch at "${stagedIps}".`);
+
+            if (options.dryRun) {
+                log.info("Dry run: skipping deployment, ./atmosphere was not touched.");
+                return;
+            }
+
+            // Deploy: the only step that touches ./atmosphere, covered by the rollback guard.
+            log.info("Deploying build to the layeredfs output folders...");
+
+            guard.mkdir(constants.NSMBUDX_EXEFS_PATH);
+            guard.mkdir(constants.NSMBUDX_EXEFS_PATCHES_PATH);
+            guard.claim(constants.NSMBUDX_SUBSDK0_PATH);
+            guard.claim(constants.NSMBUDX_IPS_PATH);
+
+            Deno.copyFileSync(stagedSubsdk0, constants.NSMBUDX_SUBSDK0_PATH);
+            Deno.copyFileSync(stagedIps, constants.NSMBUDX_IPS_PATH);
+
+            summary.deployed = true;
+            log.info(`Deployed "${constants.NSMBUDX_SUBSDK0_PATH}" and "${constants.NSMBUDX_IPS_PATH}".`);
         });
 
         guard.commit();
-        log.info("Compilation completed successfully.");
+        summary.durationMs = Math.round(performance.now() - startedAt);
+        log.info(`Compilation completed successfully in ${summary.durationMs} ms.`);
+
+        return summary;
     } catch (error) {
         log.error(error instanceof Error ? (error.stack ?? error.message) : String(error));
         log.info("Build failed. Rolling back output created by this run...");
