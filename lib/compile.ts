@@ -1,5 +1,6 @@
 import * as constants from "./constants.ts"
 import * as path from "node:path"
+import { findMissingInputs, LAYOUT_HELP, REQUIRED_FILES, REQUIRED_FOLDERS } from "./setup.ts"
 import * as modules from "../deps.ts"
 
 class CompileLog {
@@ -31,52 +32,6 @@ class CompileLog {
     close(): void {
         this.file.close();
     }
-}
-
-const REQUIRED_FOLDERS = [ "./source/code", "./source/hooks", "./source/nso", "./source/symbols" ];
-const REQUIRED_FILES = [ "./source/nso/main" ];
-
-const LAYOUT_HELP = `  source/
-    code/      your .cpp / .c / .s files
-    hooks/     your .hks hook files
-    symbols/   your .sym symbol files
-    nso/
-      main     the game's main (NSO) file, v1.0.0`;
-
-/** Everything a build needs that is not there yet. */
-function findMissingInputs(): string[] {
-    const missing: string[] = [];
-
-    for (const folder of REQUIRED_FOLDERS) {
-        if (!modules.archivo.existsAsDirectory(folder)) missing.push(`folder  ${folder}`);
-    }
-
-    for (const file of REQUIRED_FILES) {
-        if (!modules.archivo.existsAsFile(file)) missing.push(`file    ${file}`);
-    }
-
-    return missing;
-}
-
-/** `--init`: create any missing source folders (never touches existing files). Returns what it created. */
-export function initSource(): string[] {
-    const created: string[] = [];
-
-    for (const folder of REQUIRED_FOLDERS) {
-        if (!modules.archivo.existsAsDirectory(folder)) {
-            Deno.mkdirSync(folder, { recursive: true });
-            created.push(folder);
-        }
-    }
-
-    const note = "./source/nso/PUT_MAIN_HERE.txt";
-
-    if (!modules.archivo.existsAsFile("./source/nso/main") && !modules.archivo.existsAsFile(note)) {
-        Deno.writeTextFileSync(note, "Place your own legally obtained copy of the game's main file here, named exactly \"main\" (New Super Mario Bros. U Deluxe v1.0.0).\n");
-        created.push(note);
-    }
-
-    return created;
 }
 
 export interface CompileOptions {

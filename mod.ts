@@ -1,21 +1,24 @@
-import { compile, initSource } from "./lib/compile.ts";
+import { compile } from "./lib/compile.ts";
+import { findMissingInputs, runFirstTimeSetup } from "./lib/setup.ts";
 
 const HELP = `SweetDX - a sweeter way to mod New Super Mario Bros. U Deluxe
 
 Usage: sweetdx [options]
 
 Run from the folder that contains ./source (code, hooks, nso, symbols).
+On first run, SweetDX creates those folders for you and shows what to do next.
 
 Options:
   -v, --verbose   Echo the full build log to the console (always saved to debug.log)
-      --init      Create the empty ./source folders (code, hooks, nso, symbols)
       --dry-run   Build and validate everything without writing into ./atmosphere
+      --init      Set up ./source (create folders and show the guide) without building
+      --no-gui    Never open windows or Explorer; print everything to the console
       --skip-build-id-check
                   Build even if source/nso/main is not the supported game version
   -h, --help      Show this help
 `;
 
-const KNOWN = new Set([ "-v", "--verbose", "--init", "--dry-run", "--skip-build-id-check", "-h", "--help" ]);
+const KNOWN = new Set([ "-v", "--verbose", "--dry-run", "--init", "--no-gui", "--skip-build-id-check", "-h", "--help" ]);
 const unknown = Deno.args.filter(arg => !KNOWN.has(arg));
 
 if (Deno.args.includes("-h") || Deno.args.includes("--help")) {
@@ -29,12 +32,19 @@ if (unknown.length > 0) {
     Deno.exit(2);
 }
 
-if (Deno.args.includes("--init")) {
-    const created = initSource();
+// First run (or --init): create the folders, open them and show what to do next. Nothing is built.
+const needsSetup = findMissingInputs().length > 0;
 
-    console.log(created.length > 0 ? `Created:\n  ${created.join("\n  ")}` : "Nothing to create: the source folders already exist.");
-    console.log("\nNext: put your own legally obtained game main file at source/nso/main, then run SweetDX again.");
-    Deno.exit(0);
+if (Deno.args.includes("--init") || needsSetup) {
+    if (!needsSetup) {
+        console.log("Everything is already set up: the source folders and source/nso/main exist.");
+        Deno.exit(0);
+    }
+
+    const result = runFirstTimeSetup({ gui: !Deno.args.includes("--no-gui") });
+
+    console.log(`\n${result.message}\n`);
+    Deno.exit(2); // setup was needed, so nothing was built
 }
 
 try {
