@@ -24,15 +24,24 @@ const FIELDS_BY_TYPE: Record<HookType, { readonly required: readonly string[]; r
     data: { required: ["type", "address", "data"], optional: [] },
 };
 
+/** "0x1234 @ explanation" -> "0x1234". Only an @ preceded by whitespace starts a comment. */
+function stripInlineComment(value: string): string {
+    return value.replace(/\s@.*$/, "").trim();
+}
+
 export class Hks {
     readonly file: archivo.Archivo;
     readonly hooks: readonly HookDefinition[];
 
     constructor(public readonly path: string) {
-        this.file = new archivo.Archivo(path);
-        this.hooks = this.parse(this.file.readAsText());
+        // Read-only (works on read-only files) and always closed, even when parsing throws.
+        this.file = new archivo.Archivo(path, { readOnly: true });
 
-        this.file.close();
+        try {
+            this.hooks = this.parse(this.file.readAsText());
+        } finally {
+            this.file.close();
+        }
     }
 
     findHook(name: string): HookDefinition | undefined {
@@ -92,7 +101,7 @@ export class Hks {
                 throw new Error(`Duplicate field "${key}" for hook "${name}" at line ${i + 1} in "${this.path}".`);
             }
 
-            fields.set(key, { value: value.trim(), line: i + 1 });
+            fields.set(key, { value: stripInlineComment(value), line: i + 1 });
         }
 
         finalize();
@@ -103,8 +112,9 @@ export class Hks {
     private buildHook(name: string, nameLine: number, fields: Map<string, RawField>): HookDefinition {
         const type = fields.get("type")?.value;
 
-        if (!type || !(type in FIELDS_BY_TYPE)) {
-            throw new Error(`Hook "${name}" at line ${nameLine} in "${this.path}" has a missing or invalid "type" (expected "hook", "instr" or "data").`);
+        // Object.hasOwn: plain "in" also matched inherited names such as "constructor" and then crashed.
+        if (!type || !Object.hasOwn(FIELDS_BY_TYPE, type)) {
+            throw new Error(`Hook "${name}" at line ${nameLine} in "${this.path}" has a missing or invalid "type" (expected "hook", "call", "instr" or "data").`);
         }
 
         const spec = FIELDS_BY_TYPE[type as HookType];
@@ -121,7 +131,14 @@ export class Hks {
             }
         }
 
-        const address = utils.dehexify(fields.get("address")!.value);
+        const addressField = fields.get("address")!;
+        let address: number;
+
+        try {
+            address = utils.dehexify(addressField.value);
+        } catch {
+            throw new Error(`Hook "${name}" at line ${addressField.line} in "${this.path}" has an invalid address "${addressField.value}" (expected hexadecimal such as 0x00123456; comments start with "@").`);
+        }
 
         switch (type as HookType) {
             case "hook": {

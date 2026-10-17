@@ -13,10 +13,13 @@ export class Sym {
     readonly symbols: readonly SymEntry[];
 
     constructor(public readonly path: string) {
-        this.file = new archivo.Archivo(path);
-        this.symbols = this.parse(this.file.readAsText());
+        this.file = new archivo.Archivo(path, { readOnly: true });
 
-        this.file.close();
+        try {
+            this.symbols = this.parse(this.file.readAsText());
+        } finally {
+            this.file.close();
+        }
     }
 
     findSymbol(name: string): SymEntry | undefined {
@@ -37,6 +40,7 @@ export class Sym {
 
     private parse(text: string): SymEntry[] {
         const symbols: SymEntry[] = [];
+        const firstSeenAt = new Map<string, number>();
         const lines = text.split(/\r\n|\r|\n/);
 
         for (let i = 0; i < lines.length; i++) {
@@ -52,6 +56,13 @@ export class Sym {
             }
 
             const [, name, hex] = match;
+            const first = firstSeenAt.get(name);
+
+            if (first !== undefined) {
+                throw new Error(`Duplicate symbol "${name}" at line ${i + 1} in "${this.path}" (first defined at line ${first}).`);
+            }
+
+            firstSeenAt.set(name, i + 1);
 
             symbols.push({ name, address: utils.dehexify(hex) });
         }

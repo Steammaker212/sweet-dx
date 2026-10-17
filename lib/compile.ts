@@ -315,6 +315,21 @@ export function compile(options: CompileOptions = {}): CompileSummary {
             return hks.hooks;
         }).flat();
 
+        // The same name at two different addresses across .sym files would silently resolve to one of them.
+        const symbolOwners = new Map<string, { file: string, address: number }>();
+
+        for (const sym of symbols) {
+            for (const entry of sym.symbols) {
+                const owner = symbolOwners.get(entry.name);
+
+                if (owner && owner.address !== entry.address) {
+                    throw new Error(`Symbol "${entry.name}" is defined with different addresses (${modules.utils.hexify(owner.address)} in "${owner.file}", ${modules.utils.hexify(entry.address)} in "${sym.path}").`);
+                }
+
+                symbolOwners.set(entry.name, { file: sym.path, address: entry.address });
+            }
+        }
+
         const ips = new modules.lunar.IPSPatch();
 
         const addPatch = (patch: { address: number, data: Uint8Array }, reason: string): void => {
