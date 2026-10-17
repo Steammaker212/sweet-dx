@@ -148,13 +148,13 @@ export class Hks {
                     name,
                     type: "hook",
                     address,
-                    symbol: this.resolveSymbol(fields.get("symbol")!.value),
-                    ...(trampoline !== undefined ? { trampoline: this.resolveSymbol(trampoline) } : {}),
+                    symbol: this.resolveField(name, fields.get("symbol")!),
+                    ...(trampoline !== undefined ? { trampoline: this.resolveField(name, fields.get("trampoline")!) } : {}),
                 };
             }
 
             case "call":
-                return { name, type: "call", address, symbol: this.resolveSymbol(fields.get("symbol")!.value) };
+                return { name, type: "call", address, symbol: this.resolveField(name, fields.get("symbol")!) };
 
             case "instr":
                 return { name, type: "instr", address, instruction: fields.get("instruction")!.value };
@@ -164,6 +164,15 @@ export class Hks {
 
                 return { name, type: "data", address, data: this.parseDataBytes(data.value, data.line) };
             }
+        }
+    }
+
+    /** resolveSymbol with the hook name and line attached, so a mangling failure says WHICH hook. */
+    private resolveField(hookName: string, field: RawField): string {
+        try {
+            return this.resolveSymbol(field.value);
+        } catch (error) {
+            throw new Error(`Hook "${hookName}" at line ${field.line} in "${this.path}" has a symbol that could not be resolved ("${field.value}"):\n${error instanceof Error ? error.message : String(error)}`);
         }
     }
 

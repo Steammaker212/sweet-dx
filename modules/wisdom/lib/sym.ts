@@ -6,7 +6,8 @@ export type SymEntry = {
     readonly address: number;
 };
 
-const STATEMENT_PATTERN = /^([^\s=]+)\s*=\s*(-?0x[0-9a-fA-F]+)\s*;$/i;
+// The trailing ";" is optional: codedx's own main.sym omits it on its first entry.
+const STATEMENT_PATTERN = /^([^\s=]+)\s*=\s*(-?0x[0-9a-fA-F]+)\s*;?$/i;
 
 export class Sym {
     readonly file: archivo.Archivo;

@@ -41,6 +41,8 @@ export interface CompileOptions {
     dryRun?: boolean;
     /** Downgrade the "wrong game version" (build ID) error to a warning. */
     skipBuildIdCheck?: boolean;
+    /** Let the linker leave undefined symbols unresolved (they become address 0 at runtime). */
+    allowUnresolved?: boolean;
 }
 
 export interface CompileSummary {
@@ -436,6 +438,10 @@ export function compile(options: CompileOptions = {}): CompileSummary {
         log.info("Validating inputs...");
         validateInputs();
 
+        if (code.some(file => file.entry.extension === ".c" || file.entry.extension === ".s")) {
+            requireTool(log, "clang", "Install LLVM/Clang and make sure clang is on your PATH (needed for .c and .s files).");
+        }
+
         const assets = {
             crt0: modules.way.join(import.meta.dirname!, "../assets/crt0.s"),
             linker: modules.way.join(import.meta.dirname!, "../assets/linker.ld"),
@@ -541,24 +547,47 @@ ${hook.trampoline}:
             log.info("Invoking clang++...");
             log.info("");
 
-            const commonFlags = [
+            // These mirror codedx's Makefile. In particular "-mabi=aapcs-linux" was missing: the
+            // plain bare-metal EABI default uses SHORT enums and a 2-byte wchar_t, but the game was
+            // built for the Linux-style ABI (4-byte enums), so any struct or function in your code
+            // that touched an enum would have disagreed with the game about sizes and layout.
+            const root = modules.way.cwd();
+            const archFlags = [
                 "--target=armv7l-none-eabihf",
+                "-mabi=aapcs-linux",
                 "-mcpu=cortex-a57",
                 "-mfpu=crypto-neon-fp-armv8",
                 "-mfloat-abi=hard",
                 "-fPIC",
-                "-nostdlib",
-                "-fno-rtti",
-                "-fno-exceptions",
-                "-fpermissive",
-                "-I",
-                modules.way.join(modules.way.cwd(), "./source/code")
+                "-nostdlib"
             ];
 
-            const inputs = [
-                assets.crt0,
-                asm.info.entry.path.normal,
-                ...code.map(({ entry }) => entry.path.normal)
+            // codedx keeps its headers in ./include (-iquote); ./source/code is searched too.
+            const includeFlags = [
+                "-iquote", modules.way.join(root, "./include"),
+                "-I", modules.way.join(root, "./include"),
+                "-iquote", modules.way.join(root, "./source/code"),
+                "-I", modules.way.join(root, "./source/code")
+            ];
+
+            const cxxFlags = [ ...archFlags, ...includeFlags, "-fno-rtti", "-fno-exceptions", "-fpermissive" ];
+            const cFlags = [ ...archFlags, ...includeFlags ];
+            const asmFlags = [ ...archFlags, "-x", "assembler-with-cpp" ];
+
+            // Like the original: .cpp -> clang++, .c -> clang (as C, not C++), .s -> clang with the
+            // C preprocessor enabled (#include / #define work in assembly). SweetDX's own crt0 and
+            // generated hook trampolines keep the plain clang++ path they always used.
+            const inputs: { path: string, tool: "clang++" | "clang", args: string[] }[] = [
+                { path: assets.crt0, tool: "clang++", args: cxxFlags },
+                { path: asm.info.entry.path.normal, tool: "clang++", args: cxxFlags },
+                ...code.map(({ entry }) => {
+                    const path = entry.path.normal;
+
+                    if (entry.extension === ".c") return { path, tool: "clang" as const, args: cFlags };
+                    if (entry.extension === ".s") return { path, tool: "clang" as const, args: asmFlags };
+
+                    return { path, tool: "clang++" as const, args: cxxFlags };
+                })
             ];
 
             const objs: string[] = [];
@@ -567,15 +596,15 @@ ${hook.trampoline}:
             // One invocation per file with an explicit -o. A single multi-file invocation names
             // objects after the file's basename, so two files called util.cpp in different
             // folders (or a user file called hooks.cpp / crt0.cpp) silently overwrote each other.
-            for (const [ index, input ] of inputs.entries()) {
+            for (const [ index, { path: input, tool, args } ] of inputs.entries()) {
                 const base = input.split(/[\\/]/).pop()!.replace(/\.[^.]*$/, "");
                 const obj = modules.way.join(dirpath, `${index}_${base}.o`);
 
-                argv = [ ...commonFlags, "-c", input, "-o", obj ];
+                argv = [ ...args, "-c", input, "-o", obj ];
 
-                const result = modules.child_process.spawnSync("clang++", argv, { stdio: "pipe", cwd: dirpath });
+                const result = modules.child_process.spawnSync(tool, argv, { stdio: "pipe", cwd: dirpath });
 
-                logProcessOutput(log, "clang++", result, argv);
+                logProcessOutput(log, tool, result, argv);
 
                 if (result.error || result.status !== 0) {
                     const stderr = result.stderr ? modules.utils.decode(result.stderr).trim() : "";
@@ -591,7 +620,7 @@ ${hook.trampoline}:
             if (failures.length > 0) {
                 const report = failures.join("\n\n");
 
-                throw new Error(`clang++ failed on ${failures.length} of ${inputs.length} file(s):\n\n${report.length > 12000 ? report.slice(0, 12000) + "\n... (truncated, see debug.log)" : report}`);
+                throw new Error(`The compiler failed on ${failures.length} of ${inputs.length} file(s):\n\n${report.length > 12000 ? report.slice(0, 12000) + "\n... (truncated, see debug.log)" : report}`);
             }
 
             if (objs.length === 0) {
@@ -606,14 +635,31 @@ ${hook.trampoline}:
             const linkResult = modules.child_process.spawnSync("arm-none-eabi-ld", (argv = [
                 "-pie",
                 ...linkers,
-                "--unresolved-symbols=ignore-all",
+                // codedx links strictly: an undefined reference fails the build. SweetDX used to pass
+                // --unresolved-symbols=ignore-all, which turned every typo into a silent jump to address 0.
+                ...(options.allowUnresolved ? [ "--unresolved-symbols=ignore-all" ] : []),
                 ...objs,
                 "-o",
                 elfpath
             ]), { stdio: "pipe", cwd: dirpath });
 
             logProcessOutput(log, "arm-none-eabi-ld", linkResult, argv);
-            checkSpawnResult("arm-none-eabi-ld", linkResult);
+            try {
+                checkSpawnResult("arm-none-eabi-ld", linkResult);
+            } catch (error) {
+                const stderr = linkResult.stderr ? modules.utils.decode(linkResult.stderr) : "";
+
+                if (/undefined (reference|symbol)/i.test(stderr)) {
+                    throw new Error(
+                        `${(error as Error).message}\n\n` +
+                        `The symbols above are used by your code but defined nowhere. Add game functions/data to a ` +
+                        `.sym file in source/symbols, or define them in source/code. ` +
+                        `(--allow-unresolved leaves them unresolved, but they will be address 0 at runtime.)`
+                    );
+                }
+
+                throw error;
+            }
             log.info("");
 
             log.info(`Linked ELF at "${elfpath}".`);
