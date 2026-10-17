@@ -1,4 +1,5 @@
 import * as constants from "./constants.ts"
+import * as path from "node:path"
 import * as modules from "../deps.ts"
 
 class CompileLog {
@@ -29,6 +30,106 @@ class CompileLog {
     }
 }
 
+const BACKUP_SUFFIX = ".sweetdx-bak";
+
+function pathExists(p: string): boolean {
+    try {
+        Deno.lstatSync(p);
+        return true;
+    } catch (e) {
+        if (e instanceof Deno.errors.NotFound) return false;
+        throw e;
+    }
+}
+
+/**
+ * Tracks everything a single compile run creates so that a failed run can be
+ * undone WITHOUT touching anything it did not create (e.g. a pre-existing
+ * "atmosphere" folder, other mods' files, or the last successful build).
+ */
+class OutputGuard {
+    private readonly createdDirs: string[] = [];
+    private readonly claimed: { file: string; backup: string | null }[] = [];
+
+    /** mkdir -p that remembers which directories did not exist before. */
+    mkdir(dir: string): void {
+        const missing: string[] = [];
+        let current = path.resolve(dir);
+
+        while (!pathExists(current)) {
+            missing.push(current); // deepest first
+            const parent = path.dirname(current);
+            if (parent === current) break;
+            current = parent;
+        }
+
+        Deno.mkdirSync(dir, { recursive: true });
+        this.createdDirs.push(...missing);
+    }
+
+    /** Reserve an output file. An existing file is moved aside as a backup. */
+    claim(file: string): void {
+        const backup = file + BACKUP_SUFFIX;
+
+        // A backup left behind means a previous run was killed mid-build:
+        // the backup is the user's real file, the current file is partial.
+        if (pathExists(backup)) {
+            if (pathExists(file)) Deno.removeSync(file);
+            Deno.renameSync(backup, file);
+        }
+
+        if (pathExists(file)) {
+            Deno.renameSync(file, backup);
+            this.claimed.push({ file, backup });
+        } else {
+            this.claimed.push({ file, backup: null });
+        }
+    }
+
+    /** Build succeeded: drop the backups of the files we replaced. */
+    commit(): void {
+        for (const { backup } of this.claimed) {
+            try {
+                if (backup && pathExists(backup)) Deno.removeSync(backup);
+            } catch {
+                // Leftover backup is harmless; it is recovered/replaced on the next run.
+            }
+        }
+    }
+
+    /** Build failed: remove our partial output, restore what was there before. */
+    rollback(log: CompileLog): void {
+        for (const { file, backup } of this.claimed) {
+            try {
+                if (pathExists(file)) Deno.removeSync(file);
+                if (backup && pathExists(backup)) Deno.renameSync(backup, file);
+            } catch (e) {
+                log.error(`Rollback problem with "${file}": ${e instanceof Error ? e.message : String(e)}`);
+            }
+        }
+
+        // Only directories this run created, and only if they are empty.
+        for (const dir of this.createdDirs) {
+            try {
+                Deno.removeSync(dir);
+            } catch {
+                // Not empty or already gone: leave it alone.
+            }
+        }
+    }
+}
+
+function requireTool(log: CompileLog, name: string, hint: string): void {
+    const result = modules.child_process.spawnSync(name, [ "--version" ], { stdio: "pipe" });
+
+    if (result.error || result.status !== 0) {
+        throw new Error(`Required tool "${name}" was not found on your PATH. ${hint}`);
+    }
+
+    const firstLine = modules.utils.decode(result.stdout as Uint8Array).split(/\r?\n/)[0]?.trim();
+    log.info(`Found ${name}: ${firstLine}`);
+}
+
 function checkSpawnResult(name: string, proc: { status: number | null; error?: Error }): void {
     if (proc.error) {
         throw new Error(`Failed to run "${name}": ${proc.error.message}`);
@@ -49,6 +150,7 @@ function logProcessOutput(log: CompileLog, name: string, proc: { stdout: Uint8Ar
 
 export function compile() {
     const log = new CompileLog("./debug.log");
+    const guard = new OutputGuard();
 
     try {
         log.info("Checking source environment...");
@@ -65,10 +167,18 @@ export function compile() {
             }
         });
 
+        log.info("Checking required tools...");
+
+        requireTool(log, "clang++", "Install LLVM/Clang and make sure clang++ is on your PATH.");
+        requireTool(log, "arm-none-eabi-ld", "Install the Arm GNU Toolchain (arm-none-eabi) and make sure it is on your PATH.");
+
         log.info("Creating output directories...");
 
-        Deno.mkdirSync(constants.NSMBUDX_EXEFS_PATCHES_PATH, { recursive: true });
-        Deno.mkdirSync(constants.NSMBUDX_EXEFS_PATH, { recursive: true });
+        guard.mkdir(constants.NSMBUDX_EXEFS_PATCHES_PATH);
+        guard.mkdir(constants.NSMBUDX_EXEFS_PATH);
+
+        guard.claim(constants.NSMBUDX_SUBSDK0_PATH);
+        guard.claim(constants.NSMBUDX_IPS_PATH);
 
         log.info("Listing source files...");
 
@@ -109,7 +219,7 @@ export function compile() {
         log.info(`Found ${code.length} source file(s), ${symbols.length} symbol file(s) and ${hooks.length} hook definition(s).`);
 
         if (code.length === 0) {
-            throw new Error("No .cpp source files were found under \"./source\".");
+            throw new Error("No .cpp, .c or .s source files were found under \"./source\".");
         }
 
         const assets = {
@@ -193,11 +303,11 @@ ${hook.trampoline}:
 
             log.info("Wrote hook trampolines to \"hooks.s\".");
 
-            for (const sym of symbols) {
-                const path = modules.way.join(dirpath, `${Math.random()}.ld`);
+            for (const [ index, sym ] of symbols.entries()) {
+                const linkerPath = modules.way.join(dirpath, `symbols_${index}.ld`);
 
-                sym.toLinker(path, constants.NSMBUDX_NSO_MEMORY_SIZE);
-                linkers.push("-T", path);
+                sym.toLinker(linkerPath, constants.NSMBUDX_NSO_MEMORY_SIZE);
+                linkers.push("-T", linkerPath);
             }
 
             log.info("Generated linker scripts for symbol file(s).");
@@ -286,7 +396,7 @@ ${hook.trampoline}:
                 const trampolineSymbol = trampolineName ? elf.findSymbol(trampolineName) : null;
 
                 if (!hookSymbol) throw new Error("Could not find hook symbol: " + hook.symbol);
-                if (trampolineSymbol === undefined) throw new Error("Could not find trampoline symbol: " + trampolineName);
+                if (trampolineName && !trampolineSymbol) throw new Error("Could not find trampoline symbol: " + trampolineName);
 
                 log.info(`Resolved hook symbol "${hook.symbol}" (${hook.name}) at ${modules.utils.hexify(Number(hookSymbol.value))}${trampolineSymbol ? `, trampoline "${trampolineName}" at ${modules.utils.hexify(Number(trampolineSymbol.value))}` : " (no trampoline)"}.`);
 
@@ -341,16 +451,17 @@ ${hook.trampoline}:
             log.info(`Wrote IPS patch to "${constants.NSMBUDX_IPS_PATH}".`);
         });
 
+        guard.commit();
         log.info("Compilation completed successfully.");
     } catch (error) {
         log.error(error instanceof Error ? (error.stack ?? error.message) : String(error));
-        console.error(error instanceof Error ? (error.message) : error);
+        log.info("Build failed. Rolling back output created by this run...");
 
-        try {
-            Deno.removeSync("./atmosphere", { recursive: true });
-        } catch {
-            // .
-        }
+        // Undo ONLY what this run created. Never delete ./atmosphere wholesale.
+        guard.rollback(log);
+
+        // Let the caller (mod.ts) report the error and set a failing exit code.
+        throw error;
     } finally {
         log.close();
     }
