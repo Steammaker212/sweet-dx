@@ -33,6 +33,52 @@ class CompileLog {
     }
 }
 
+const REQUIRED_FOLDERS = [ "./source/code", "./source/hooks", "./source/nso", "./source/symbols" ];
+const REQUIRED_FILES = [ "./source/nso/main" ];
+
+const LAYOUT_HELP = `  source/
+    code/      your .cpp / .c / .s files
+    hooks/     your .hks hook files
+    symbols/   your .sym symbol files
+    nso/
+      main     the game's main (NSO) file, v1.0.0`;
+
+/** Everything a build needs that is not there yet. */
+function findMissingInputs(): string[] {
+    const missing: string[] = [];
+
+    for (const folder of REQUIRED_FOLDERS) {
+        if (!modules.archivo.existsAsDirectory(folder)) missing.push(`folder  ${folder}`);
+    }
+
+    for (const file of REQUIRED_FILES) {
+        if (!modules.archivo.existsAsFile(file)) missing.push(`file    ${file}`);
+    }
+
+    return missing;
+}
+
+/** `--init`: create any missing source folders (never touches existing files). Returns what it created. */
+export function initSource(): string[] {
+    const created: string[] = [];
+
+    for (const folder of REQUIRED_FOLDERS) {
+        if (!modules.archivo.existsAsDirectory(folder)) {
+            Deno.mkdirSync(folder, { recursive: true });
+            created.push(folder);
+        }
+    }
+
+    const note = "./source/nso/PUT_MAIN_HERE.txt";
+
+    if (!modules.archivo.existsAsFile("./source/nso/main") && !modules.archivo.existsAsFile(note)) {
+        Deno.writeTextFileSync(note, "Place your own legally obtained copy of the game's main file here, named exactly \"main\" (New Super Mario Bros. U Deluxe v1.0.0).\n");
+        created.push(note);
+    }
+
+    return created;
+}
+
 export interface CompileOptions {
     /** Echo every log line to the console as well as debug.log. */
     verbose?: boolean;
@@ -253,11 +299,22 @@ export function compile(options: CompileOptions = {}): CompileSummary {
     try {
         log.info("Checking source environment...");
 
+        const missing = findMissingInputs();
+
+        if (missing.length > 0) {
+            throw new Error(
+                `Your source folder is not set up yet. Missing:\n  - ${missing.join("\n  - ")}\n\n` +
+                `SweetDX looked in: ${modules.way.cwd()}\n(run it from the folder that contains "source")\n\n` +
+                `Expected layout:\n${LAYOUT_HELP}\n\n` +
+                `Run with --init to create the empty folders. You must supply your own legally obtained copy of the game's main.`
+            );
+        }
+
         modules.archivo.checkEnviroment({
             root: modules.way.cwd(),
 
-            folders: [ "./source/code", "./source/hooks", "./source/nso", "./source/symbols" ],
-            files: [ "./source/nso/main" ],
+            folders: REQUIRED_FOLDERS,
+            files: REQUIRED_FILES,
 
             // NOTE: "available" means "must NOT already exist". ./atmosphere used to be
             // listed here, so any existing atmosphere folder failed the check and the
@@ -601,7 +658,7 @@ ${hook.trampoline}:
             const bss = elf.findSection(".bss");
 
             if (!dynstr || !dynsym || !bss) throw new Error("Missing either one or more important sections: .dynsym, .dynstr, .bss");
-            if (elf.loadableSegments.length !== 3) throw new Error("Loadable segments count must be exactly 3");
+            if (elf.loadableSegments.length !== 3) throw new Error(`Loadable segments count must be exactly 3 (text, ro, data) but the linked ELF has ${elf.loadableSegments.length}. Check assets/linker.ld and that your code produces all three.`);
 
             log.info("Resolved required ELF sections and loadable segments.");
 
@@ -627,7 +684,19 @@ ${hook.trampoline}:
                 const trampolineName = hook.type === "hook" ? hook.trampoline : undefined;
                 const trampolineSymbol = trampolineName ? elf.findSymbol(trampolineName) : null;
 
-                if (!hookSymbol) throw new Error("Could not find hook symbol: " + hook.symbol);
+                if (!hookSymbol) throw new Error(`Could not find hook symbol "${hook.symbol}" (hook "${hook.name}"). Make sure the function is defined in ./source/code with exactly this name; C++ symbols must match their mangled name.`);
+
+                // The linker runs with --unresolved-symbols=ignore-all, so a function that is
+                // referenced but never defined shows up as an UNDEFINED symbol with value 0 and
+                // the hook would silently jump to the start of subsdk0.
+                if (hookSymbol.isUndefined) {
+                    throw new Error(`Hook symbol "${hook.symbol}" (hook "${hook.name}") is referenced but never defined. Check that the function exists in your source with exactly this name and signature.`);
+                }
+
+                if (Number(hookSymbol.value) % 4 !== 0) {
+                    throw new Error(`Hook symbol "${hook.symbol}" (hook "${hook.name}") is at ${modules.utils.hexify(Number(hookSymbol.value))}, which is not 4-byte aligned. Is it a Thumb function? Hooks must be ARM mode.`);
+                }
+
                 if (trampolineName && !trampolineSymbol) throw new Error("Could not find trampoline symbol: " + trampolineName);
 
                 log.info(`Resolved hook symbol "${hook.symbol}" (${hook.name}) at ${modules.utils.hexify(Number(hookSymbol.value))}${trampolineSymbol ? `, trampoline "${trampolineName}" at ${modules.utils.hexify(Number(trampolineSymbol.value))}` : " (no trampoline)"}.`);

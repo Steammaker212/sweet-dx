@@ -1,4 +1,4 @@
-import { compile } from "./lib/compile.ts";
+import { compile, initSource } from "./lib/compile.ts";
 
 const HELP = `SweetDX - a sweeter way to mod New Super Mario Bros. U Deluxe
 
@@ -8,13 +8,14 @@ Run from the folder that contains ./source (code, hooks, nso, symbols).
 
 Options:
   -v, --verbose   Echo the full build log to the console (always saved to debug.log)
+      --init      Create the empty ./source folders (code, hooks, nso, symbols)
       --dry-run   Build and validate everything without writing into ./atmosphere
       --skip-build-id-check
                   Build even if source/nso/main is not the supported game version
   -h, --help      Show this help
 `;
 
-const KNOWN = new Set([ "-v", "--verbose", "--dry-run", "--skip-build-id-check", "-h", "--help" ]);
+const KNOWN = new Set([ "-v", "--verbose", "--init", "--dry-run", "--skip-build-id-check", "-h", "--help" ]);
 const unknown = Deno.args.filter(arg => !KNOWN.has(arg));
 
 if (Deno.args.includes("-h") || Deno.args.includes("--help")) {
@@ -26,6 +27,14 @@ if (unknown.length > 0) {
     console.error(`Unknown option(s): ${unknown.join(", ")}\n`);
     console.error(HELP);
     Deno.exit(2);
+}
+
+if (Deno.args.includes("--init")) {
+    const created = initSource();
+
+    console.log(created.length > 0 ? `Created:\n  ${created.join("\n  ")}` : "Nothing to create: the source folders already exist.");
+    console.log("\nNext: put your own legally obtained game main file at source/nso/main, then run SweetDX again.");
+    Deno.exit(0);
 }
 
 try {
